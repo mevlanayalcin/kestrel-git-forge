@@ -30,8 +30,10 @@ func main() {
 		login = defaultLogin
 	}
 
-	// Short, bursty trials: trade heap for fewer collections.
-	debug.SetGCPercent(400)
+	// Short, bursty trials with a ~40 MB live heap: no collections unless the heap approaches
+	// the memory limit (a safety net, not an expected pause).
+	debug.SetGCPercent(-1)
+	debug.SetMemoryLimit(768 << 20)
 	store := newStore(login, token)
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -39,15 +41,7 @@ func main() {
 		os.Exit(1)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	server := &http.Server{
-		Handler:           store,
-		ReadHeaderTimeout: 30 * time.Second,
-	}
-	go func() {
-		if serveErr := server.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "[forge] serve: %v\n", serveErr)
-		}
-	}()
+	go serveRaw(store, listener)
 	fmt.Printf("[forge] listening on port %d\n", port)
 
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -57,7 +51,7 @@ func main() {
 	}
 	fmt.Println("[forge] registered; waiting for the env to say done")
 	waitForDone(client, envURL)
-	server.Close()
+	_ = listener.Close()
 	fmt.Println("[forge] done")
 }
 
