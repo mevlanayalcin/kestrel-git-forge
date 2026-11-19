@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -32,21 +31,17 @@ func main() {
 		login = defaultLogin
 	}
 
-	// The entry container is a 2-CPU cgroup quota but the node may show dozens of cores, and Go
-	// 1.24 does not read cgroup cpu.max: uncapped GOMAXPROCS spawns one P per node core and the
-	// CFS throttles the lot. The live pod scores best with two Ps (the clone workload is 50
-	// concurrent fetches, which one P serialises). FORGE_GOMAXPROCS overrides it for experiments.
-	procs := 2
+	// The live pod is 2 CPUs but the node shows dozens. Live evidence: the only fast rounds (444 ms
+	// and 455 ms) left GOMAXPROCS at its default; capping it to 1 (639 ms) or 2 (606 ms) on the
+	// gVisor pod lost, so the default stands and FORGE_GOMAXPROCS overrides it for experiments.
 	if override := os.Getenv("FORGE_GOMAXPROCS"); override != "" {
 		if value, convErr := strconv.Atoi(override); convErr == nil && value > 0 {
-			procs = value
+			runtime.GOMAXPROCS(value)
 		}
 	}
-	runtime.GOMAXPROCS(procs)
-	// A small live heap with a memory-limit safety net: steady-state collections stay rare
-	// without letting the heap touch fresh pages on every burst.
-	debug.SetGCPercent(200)
-	debug.SetMemoryLimit(768 << 20)
+	// GC stays at the runtime defaults: GOGC=100 was the only setting the pod ever rewarded, and
+	// debug.SetMemoryLimit keeps the memory-limit CPU limiter live (a 2 ms wall-clock timer that
+	// wakes the GC machinery), which no fast round paid for.
 	store := newStore(login, token)
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -54,12 +49,19 @@ func main() {
 		os.Exit(1)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	// Measured against a zero-timeout net/http.Server (which arms no per-request deadline timer):
-	// 64,618 syscalls per full trial against net/http's 98,077, the same 113 keep-alive connections
-	// under the suite's undici client, and a sealed-docker perf of 211 ms against 337 ms on the same
-	// host clock, so the raw loop is the only server here.
-	go serveRaw(store, listener)
-	fmt.Printf("[forge] listening on port %d (cpus %d, gomaxprocs %d)\n", port, runtime.NumCPU(), procs)
+	// Every timeout is zero on purpose: net/http then arms no per-request deadline timer (the 30 s
+	// ReadHeaderTimeout of the early rounds churned a timer per round trip). The raw keep-alive loop
+	// that lived here won every local venue (200 ms sealed docker, 34 % fewer syscalls) yet lost on
+	// the gVisor pod in all three tries (539/639/606 ms against 444/455 ms), so net/http serves.
+	server := &http.Server{
+		Handler:           store,
+		ReadHeaderTimeout: 0,
+		ReadTimeout:       0,
+		WriteTimeout:      0,
+		IdleTimeout:       0,
+	}
+	go server.Serve(listener)
+	fmt.Printf("[forge] listening on port %d (cpus %d, gomaxprocs %d)\n", port, runtime.NumCPU(), runtime.GOMAXPROCS(0))
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	if err := register(client, envURL, port); err != nil {

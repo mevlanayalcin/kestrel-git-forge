@@ -3,38 +3,11 @@ package main
 // The HTTP router: health, REST, GraphQL, MCP and the git smart-HTTP endpoints.
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 )
-
-// authorizedBytes checks "Bearer <token>" against raw header bytes without allocating.
-func (s *Store) authorizedBytes(auth []byte) bool {
-	if s.token == "" {
-		return true
-	}
-	const scheme = "Bearer "
-	if len(auth) < len(scheme) {
-		return false
-	}
-	for i := 0; i < len(scheme); i++ {
-		c := auth[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		lower := scheme[i]
-		if lower >= 'A' && lower <= 'Z' {
-			lower += 'a' - 'A'
-		}
-		if c != lower {
-			return false
-		}
-	}
-	token := auth[len(scheme):]
-	return len(token) == len(s.tokenBytes) && bytes.Equal(token, s.tokenBytes)
-}
 
 func (s *Store) authorized(r *http.Request) bool {
 	if s.token == "" {

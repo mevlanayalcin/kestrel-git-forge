@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
 const (
@@ -52,7 +51,6 @@ type Issue struct {
 	Comments []*Comment
 	Locked   bool
 	cached   []byte
-	frame    []byte
 }
 
 type PRFile struct {
@@ -84,51 +82,42 @@ type Pull struct {
 }
 
 type Repo struct {
-	mu                sync.RWMutex
-	buildMu           sync.Mutex
-	ID                int64
-	Owner             string
-	Name              string
-	Description       string
-	Private           bool
-	DefaultBranch     string
-	Created           string
-	Updated           string
-	Pushed            string
-	Objects           map[string]*Object
-	Refs              map[string]string
-	RefsGen           int64
-	Labels            map[string]*Label
-	Issues            []*Issue
-	IssueSeq          int
-	Pulls             []*Pull
-	PullSeq           int
-	CommentSeq        int64
-	LabelSeq          int64
-	jsonCache         []byte
-	packCache         map[string][]byte
-	advUploadCache    []byte
-	advUploadGen      int64
-	advRecvCache      []byte
-	advRecvGen        int64
-	refsCache         []byte
-	refsCacheGen      int64
-	frameAdvUpload    []byte
-	frameAdvUploadGen int64
-	frameAdvRecv      []byte
-	frameAdvRecvGen   int64
-	frameLsRefs       []byte
-	frameLsRefsGen    int64
-	frameFetch        map[string][]byte
-	issueByNumber     map[int]*Issue
+	mu             sync.RWMutex
+	buildMu        sync.Mutex
+	ID             int64
+	Owner          string
+	Name           string
+	Description    string
+	Private        bool
+	DefaultBranch  string
+	Created        string
+	Updated        string
+	Pushed         string
+	Objects        map[string]*Object
+	Refs           map[string]string
+	RefsGen        int64
+	Labels         map[string]*Label
+	Issues         []*Issue
+	IssueSeq       int
+	Pulls          []*Pull
+	PullSeq        int
+	CommentSeq     int64
+	LabelSeq       int64
+	jsonCache      []byte
+	packCache      map[string][]byte
+	advUploadCache []byte
+	advUploadGen   int64
+	advRecvCache   []byte
+	advRecvGen     int64
+	refsCache      []byte
+	refsCacheGen   int64
+	issueByNumber  map[int]*Issue
 }
 
 type Store struct {
 	mu         sync.RWMutex
 	login      string
 	token      string
-	tokenBytes []byte
-	byName     map[string]map[string]*Repo
 	repoSeq    int64
 	issueIDSeq int64
 	prIDSeq    int64
@@ -142,12 +131,10 @@ type Store struct {
 
 func newStore(login, token string) *Store {
 	store := &Store{
-		login:      login,
-		token:      token,
-		tokenBytes: []byte(token),
-		repoSeq:    1000,
-		repos:      make(map[string]*Repo),
-		byName:     make(map[string]map[string]*Repo),
+		login:   login,
+		token:   token,
+		repoSeq: 1000,
+		repos:   make(map[string]*Repo),
 	}
 	store.user = User{ID: 1000, Login: login, Name: login, Email: login + "@example.invalid"}
 	return store
@@ -167,23 +154,6 @@ func (s *Store) nextPullID() int64 {
 
 func (s *Store) nextCommentID() int64 {
 	return atomic.AddInt64(&s.commentSeq, 1) + 30_000
-}
-
-// repoFast looks a repository up by raw path bytes without allocating.
-func (s *Store) repoFast(owner, name []byte) *Repo {
-	if len(owner) == 0 || len(name) == 0 {
-		return nil
-	}
-	ownerKey := unsafe.String(&owner[0], len(owner))
-	nameKey := unsafe.String(&name[0], len(name))
-	s.mu.RLock()
-	names := s.byName[ownerKey]
-	var repo *Repo
-	if names != nil {
-		repo = names[nameKey]
-	}
-	s.mu.RUnlock()
-	return repo
 }
 
 func (s *Store) findRepo(owner, name string) *Repo {
@@ -215,17 +185,9 @@ func (s *Store) createRepo(owner, name, description string, private bool) (*Repo
 		Refs:          make(map[string]string),
 		Labels:        make(map[string]*Label),
 		packCache:     make(map[string][]byte),
-		frameFetch:    make(map[string][]byte),
 		issueByNumber: make(map[int]*Issue, 4),
 	}
 	s.repos[key] = repo
-	ownerKey, nameKey := strings.ToLower(owner), strings.ToLower(name)
-	names := s.byName[ownerKey]
-	if names == nil {
-		names = make(map[string]*Repo, 4)
-		s.byName[ownerKey] = names
-	}
-	names[nameKey] = repo
 	s.order = append(s.order, repo)
 	return repo, true
 }
@@ -238,9 +200,6 @@ func (s *Store) deleteRepo(owner, name string) bool {
 		return false
 	}
 	delete(s.repos, key)
-	if names := s.byName[strings.ToLower(owner)]; names != nil {
-		delete(names, strings.ToLower(name))
-	}
 	for i, repo := range s.order {
 		if repoKey(repo.Owner, repo.Name) == key {
 			s.order = append(s.order[:i], s.order[i+1:]...)
@@ -645,13 +604,9 @@ func (r *Repo) newIssue(id int64, title, body string, labels []string) *Issue {
 	return issue
 }
 
+// findIssue looks one issue up by number. Callers hold the repo lock.
 func (r *Repo) findIssue(number int) *Issue {
-	for _, issue := range r.Issues {
-		if issue.Number == number {
-			return issue
-		}
-	}
-	return nil
+	return r.issueByNumber[number]
 }
 
 func (r *Repo) findPull(number int) *Pull {
