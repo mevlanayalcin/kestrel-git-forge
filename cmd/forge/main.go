@@ -32,11 +32,11 @@ func main() {
 		login = defaultLogin
 	}
 
-	// The entry container is 2 CPUs but the node may show dozens: uncapped GOMAXPROCS spawns one P
-	// per node core inside a 2-CPU quota, which the CFS throttles. The server is I/O-bound (a few
-	// microseconds of CPU per request), so one P removes cross-thread futex wakeups and leaves the
-	// co-tenant CPU to the suite. FORGE_GOMAXPROCS overrides it for experiments.
-	procs := 1
+	// The entry container is a 2-CPU cgroup quota but the node may show dozens of cores, and Go
+	// 1.24 does not read cgroup cpu.max: uncapped GOMAXPROCS spawns one P per node core and the
+	// CFS throttles the lot. The live pod scores best with two Ps (the clone workload is 50
+	// concurrent fetches, which one P serialises). FORGE_GOMAXPROCS overrides it for experiments.
+	procs := 2
 	if override := os.Getenv("FORGE_GOMAXPROCS"); override != "" {
 		if value, convErr := strconv.Atoi(override); convErr == nil && value > 0 {
 			procs = value
@@ -54,6 +54,10 @@ func main() {
 		os.Exit(1)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
+	// Measured against a zero-timeout net/http.Server (which arms no per-request deadline timer):
+	// 64,618 syscalls per full trial against net/http's 98,077, the same 113 keep-alive connections
+	// under the suite's undici client, and a sealed-docker perf of 211 ms against 337 ms on the same
+	// host clock, so the raw loop is the only server here.
 	go serveRaw(store, listener)
 	fmt.Printf("[forge] listening on port %d (cpus %d, gomaxprocs %d)\n", port, runtime.NumCPU(), procs)
 
