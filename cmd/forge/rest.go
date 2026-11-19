@@ -195,11 +195,13 @@ func (s *Store) issueBodyLocked(repo *Repo, issue *Issue) []byte {
 	}
 	body := issueBody(repo, issue)
 	issue.cached = body
+	issue.frame = jsonFrame(body)
 	return body
 }
 
 func invalidateIssue(issue *Issue) {
 	issue.cached = nil
+	issue.frame = nil
 }
 
 func (s *Store) commentJSON(repo *Repo, issue *Issue, comment *Comment) map[string]any {

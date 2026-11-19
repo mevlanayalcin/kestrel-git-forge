@@ -152,6 +152,74 @@ func cachedLsRefs(repo *Repo, args []string) []byte {
 	return body
 }
 
+// uploadAdvertisementFrame answers the v0 upload-pack advertisement as one wire frame.
+func (r *Repo) uploadAdvertisementFrame() []byte {
+	r.mu.RLock()
+	gen, frame, frameGen := r.RefsGen, r.frameAdvUpload, r.frameAdvUploadGen
+	r.mu.RUnlock()
+	if frame != nil && frameGen == gen {
+		return frame
+	}
+	body := cachedAdvertisement(r, "git-upload-pack")
+	frame = buildFrame("application/x-git-upload-pack-advertisement", body)
+	r.mu.Lock()
+	r.frameAdvUpload, r.frameAdvUploadGen = frame, gen
+	r.mu.Unlock()
+	return frame
+}
+
+// receiveAdvertisementFrame answers the v0 receive-pack advertisement as one wire frame.
+func (r *Repo) receiveAdvertisementFrame() []byte {
+	r.mu.RLock()
+	gen, frame, frameGen := r.RefsGen, r.frameAdvRecv, r.frameAdvRecvGen
+	r.mu.RUnlock()
+	if frame != nil && frameGen == gen {
+		return frame
+	}
+	body := cachedAdvertisement(r, "git-receive-pack")
+	frame = buildFrame("application/x-git-receive-pack-advertisement", body)
+	r.mu.Lock()
+	r.frameAdvRecv, r.frameAdvRecvGen = frame, gen
+	r.mu.Unlock()
+	return frame
+}
+
+// lsRefsFrame answers the clone path's ls-refs as one wire frame.
+func (r *Repo) lsRefsFrame() []byte {
+	r.mu.RLock()
+	gen, frame, frameGen := r.RefsGen, r.frameLsRefs, r.frameLsRefsGen
+	r.mu.RUnlock()
+	if frame != nil && frameGen == gen {
+		return frame
+	}
+	body := cachedLsRefs(r, []string{"peel", "symrefs", "unborn"})
+	frame = buildFrame("application/x-git-upload-pack-result", body)
+	r.mu.Lock()
+	r.frameLsRefs, r.frameLsRefsGen = frame, gen
+	r.mu.Unlock()
+	return frame
+}
+
+// fetchFrame answers a single-want depth-1 fetch as one wire frame.
+func (r *Repo) fetchFrame(want string) []byte {
+	key := "d1:" + want
+	r.mu.RLock()
+	frame := r.frameFetch[key]
+	r.mu.RUnlock()
+	if frame != nil {
+		return frame
+	}
+	body := r.cachedFetchV2(want, 1)
+	frame = buildFrame("application/x-git-upload-pack-result", body)
+	r.mu.Lock()
+	if r.frameFetch == nil {
+		r.frameFetch = make(map[string][]byte)
+	}
+	r.frameFetch[key] = frame
+	r.mu.Unlock()
+	return frame
+}
+
 // advertisementV0 is the ref advertisement for upload-pack or receive-pack.
 func advertisementV0(repo *Repo, service string) []byte {
 	caps := "agent=" + agentName

@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,9 +32,20 @@ func main() {
 		login = defaultLogin
 	}
 
-	// Short, bursty trials with a ~40 MB live heap: no collections unless the heap approaches
-	// the memory limit (a safety net, not an expected pause).
-	debug.SetGCPercent(-1)
+	// The entry container is 2 CPUs but the node may show dozens: uncapped GOMAXPROCS spawns one P
+	// per node core inside a 2-CPU quota, which the CFS throttles. The server is I/O-bound (a few
+	// microseconds of CPU per request), so one P removes cross-thread futex wakeups and leaves the
+	// co-tenant CPU to the suite. FORGE_GOMAXPROCS overrides it for experiments.
+	procs := 1
+	if override := os.Getenv("FORGE_GOMAXPROCS"); override != "" {
+		if value, convErr := strconv.Atoi(override); convErr == nil && value > 0 {
+			procs = value
+		}
+	}
+	runtime.GOMAXPROCS(procs)
+	// A small live heap with a memory-limit safety net: steady-state collections stay rare
+	// without letting the heap touch fresh pages on every burst.
+	debug.SetGCPercent(200)
 	debug.SetMemoryLimit(768 << 20)
 	store := newStore(login, token)
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
@@ -42,7 +55,7 @@ func main() {
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	go serveRaw(store, listener)
-	fmt.Printf("[forge] listening on port %d\n", port)
+	fmt.Printf("[forge] listening on port %d (cpus %d, gomaxprocs %d)\n", port, runtime.NumCPU(), procs)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	if err := register(client, envURL, port); err != nil {
