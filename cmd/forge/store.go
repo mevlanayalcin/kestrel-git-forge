@@ -82,30 +82,35 @@ type Pull struct {
 }
 
 type Repo struct {
-	mu            sync.RWMutex
-	buildMu       sync.Mutex
-	ID            int64
-	Owner         string
-	Name          string
-	Description   string
-	Private       bool
-	DefaultBranch string
-	Created       string
-	Updated       string
-	Pushed        string
-	Objects       map[string]*Object
-	Refs          map[string]string
-	RefsGen       int64
-	Labels        map[string]*Label
-	Issues        []*Issue
-	IssueSeq      int
-	Pulls         []*Pull
-	PullSeq       int
-	CommentSeq    int64
-	LabelSeq      int64
-	packCache     map[string][]byte
-	advertCache   []byte
-	advertCacheAt int64
+	mu             sync.RWMutex
+	buildMu        sync.Mutex
+	ID             int64
+	Owner          string
+	Name           string
+	Description    string
+	Private        bool
+	DefaultBranch  string
+	Created        string
+	Updated        string
+	Pushed         string
+	Objects        map[string]*Object
+	Refs           map[string]string
+	RefsGen        int64
+	Labels         map[string]*Label
+	Issues         []*Issue
+	IssueSeq       int
+	Pulls          []*Pull
+	PullSeq        int
+	CommentSeq     int64
+	LabelSeq       int64
+	jsonCache      []byte
+	packCache      map[string][]byte
+	advUploadCache []byte
+	advUploadGen   int64
+	advRecvCache   []byte
+	advRecvGen     int64
+	refsCache      []byte
+	refsCacheGen   int64
 }
 
 type Store struct {
@@ -238,13 +243,11 @@ func (r *Repo) setRef(name, oid string) {
 	r.Refs[name] = oid
 	r.RefsGen++
 	r.Pushed = baseTime
-	r.advertCache = nil
 }
 
 func (r *Repo) deleteRef(name string) {
 	delete(r.Refs, name)
 	r.RefsGen++
-	r.advertCache = nil
 }
 
 // ancestor reports whether `want` is `tip` or reachable from it through commit parents.

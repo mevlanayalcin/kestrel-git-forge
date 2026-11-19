@@ -16,6 +16,8 @@ const zeroOID = "0000000000000000000000000000000000000000"
 
 const agentName = "kestrel-forge/1.0"
 
+var hexDigits = "0123456789abcdef"
+
 func pktLine(payload []byte) []byte {
 	length := len(payload) + 4
 	if length > 65520 {
@@ -23,7 +25,10 @@ func pktLine(payload []byte) []byte {
 		payload = payload[:length-4]
 	}
 	out := make([]byte, 4, length)
-	copy(out, fmt.Sprintf("%04x", length))
+	out[0] = hexDigits[(length>>12)&0xf]
+	out[1] = hexDigits[(length>>8)&0xf]
+	out[2] = hexDigits[(length>>4)&0xf]
+	out[3] = hexDigits[length&0xf]
 	return append(out, payload...)
 }
 
@@ -75,13 +80,76 @@ func firstLine(lines [][]byte) string {
 func advertisementV2() []byte {
 	var buf bytes.Buffer
 	buf.Write(pktStr("version 2\n"))
-	buf.Write(pktStr("agent=" + agentName + "\n"))
 	buf.Write(pktStr("ls-refs=unborn\n"))
 	buf.Write(pktStr("fetch=shallow\n"))
-	buf.Write(pktStr("server-option\n"))
 	buf.Write(pktStr("object-format=sha1\n"))
 	buf.Write(pktFlush)
 	return buf.Bytes()
+}
+
+// cachedAdvertisement answers the v0 ref advertisement from the per-generation cache.
+func cachedAdvertisement(repo *Repo, service string) []byte {
+	repo.mu.RLock()
+	gen := repo.RefsGen
+	cached := repo.advUploadCache
+	cachedGen := repo.advUploadGen
+	if service == "git-receive-pack" {
+		cached = repo.advRecvCache
+		cachedGen = repo.advRecvGen
+	}
+	repo.mu.RUnlock()
+	if cached != nil && cachedGen == gen {
+		return cached
+	}
+	body := advertisementV0(repo, service)
+	repo.mu.Lock()
+	if service == "git-receive-pack" {
+		repo.advRecvCache = body
+		repo.advRecvGen = gen
+	} else {
+		repo.advUploadCache = body
+		repo.advUploadGen = gen
+	}
+	repo.mu.Unlock()
+	return body
+}
+
+// isDefaultLsRefs reports the clone path's argument set: no ref-prefix, peel+symrefs+unborn.
+func isDefaultLsRefs(args []string) bool {
+	peel, symrefs, unborn := false, false, false
+	for _, arg := range args {
+		switch {
+		case arg == "peel":
+			peel = true
+		case arg == "symrefs":
+			symrefs = true
+		case arg == "unborn":
+			unborn = true
+		case strings.HasPrefix(arg, "agent="), strings.HasPrefix(arg, "object-format="), arg == "":
+			// protocol noise the cache key does not carry
+		default:
+			return false
+		}
+	}
+	return peel && symrefs && unborn
+}
+
+// cachedLsRefs answers the clone path's ls-refs (no prefixes, peel+symrefs+unborn) from cache.
+func cachedLsRefs(repo *Repo, args []string) []byte {
+	repo.mu.RLock()
+	gen := repo.RefsGen
+	cached := repo.refsCache
+	cachedGen := repo.refsCacheGen
+	repo.mu.RUnlock()
+	if cached != nil && cachedGen == gen {
+		return cached
+	}
+	body := lsRefs(repo, args)
+	repo.mu.Lock()
+	repo.refsCache = body
+	repo.refsCacheGen = gen
+	repo.mu.Unlock()
+	return body
 }
 
 // advertisementV0 is the ref advertisement for upload-pack or receive-pack.

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 )
 
 type ObjectType int
@@ -268,20 +269,72 @@ func (c *countReader) ReadByte() (byte, error) {
 	return b, err
 }
 
+// zlib readers hold ~40 KiB of inflate tables; pushes inflate three objects each, so a pool
+// keeps the timed push path allocation-free.
+type zlibHolder struct {
+	rc io.ReadCloser
+}
+
+var zlibPool = sync.Pool{New: func() any { return &zlibHolder{} }}
+
+var inflateBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, 64<<10)
+	return &buffer
+}}
+
 func inflateAt(data []byte) ([]byte, int, error) {
+	return inflateAtSize(data, 0)
+}
+
+// inflateAtSize inflates one zlib stream, sizing the output from the pack header when known.
+func inflateAtSize(data []byte, size int) ([]byte, int, error) {
 	src := &countReader{r: bytes.NewReader(data)}
-	zr, err := zlib.NewReader(src)
-	if err != nil {
-		return nil, 0, err
+	holder := zlibPool.Get().(*zlibHolder)
+	var zr io.ReadCloser
+	if holder.rc == nil {
+		created, err := zlib.NewReader(src)
+		if err != nil {
+			zlibPool.Put(holder)
+			return nil, 0, err
+		}
+		holder.rc = created
+		zr = created
+	} else {
+		if resetErr := holder.rc.(zlib.Resetter).Reset(src, nil); resetErr != nil {
+			holder.rc.Close()
+			holder.rc = nil
+			zlibPool.Put(holder)
+			return nil, 0, resetErr
+		}
+		zr = holder.rc
 	}
-	out, err := io.ReadAll(zr)
-	closeErr := zr.Close()
-	if err != nil {
-		return nil, src.n, err
+	if size < 0 || size > 64<<20 {
+		size = 0
 	}
-	if closeErr != nil {
+	out := make([]byte, 0, size)
+	bufferPtr := inflateBufferPool.Get().(*[]byte)
+	buffer := *bufferPtr
+	for {
+		n, readErr := zr.Read(buffer)
+		if n > 0 {
+			out = append(out, buffer[:n]...)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			inflateBufferPool.Put(bufferPtr)
+			zr.Close()
+			zlibPool.Put(holder)
+			return nil, src.n, readErr
+		}
+	}
+	inflateBufferPool.Put(bufferPtr)
+	if closeErr := zr.Close(); closeErr != nil {
+		zlibPool.Put(holder)
 		return nil, src.n, closeErr
 	}
+	zlibPool.Put(holder)
 	return out, src.n, nil
 }
 
@@ -447,7 +500,7 @@ func readPack(data []byte, resolve func(oid string) *Object) (map[string]*Object
 		if pos >= len(data)-20 {
 			return nil, errors.New("pack data ended early")
 		}
-		payload, used, err := inflateAt(data[pos : len(data)-20])
+		payload, used, err := inflateAtSize(data[pos:len(data)-20], size)
 		if err != nil {
 			return nil, err
 		}

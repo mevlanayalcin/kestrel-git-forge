@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 )
@@ -29,6 +30,8 @@ func main() {
 		login = defaultLogin
 	}
 
+	// Short, bursty trials: trade heap for fewer collections.
+	debug.SetGCPercent(400)
 	store := newStore(login, token)
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {

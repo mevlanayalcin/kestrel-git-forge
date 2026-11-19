@@ -119,9 +119,9 @@ func (s *Store) gitInfoRefs(w http.ResponseWriter, r *http.Request, repo *Repo) 
 			writeGitBody(w, "application/x-git-upload-pack-advertisement", advertisementV2())
 			return
 		}
-		writeGitBody(w, "application/x-git-upload-pack-advertisement", advertisementV0(repo, service))
+		writeGitBody(w, "application/x-git-upload-pack-advertisement", cachedAdvertisement(repo, service))
 	case "git-receive-pack":
-		writeGitBody(w, "application/x-git-receive-pack-advertisement", advertisementV0(repo, service))
+		writeGitBody(w, "application/x-git-receive-pack-advertisement", cachedAdvertisement(repo, service))
 	default:
 		s.fail(w, 404, "Not Found")
 	}
@@ -158,6 +158,10 @@ func (s *Store) gitUploadPack(w http.ResponseWriter, r *http.Request, repo *Repo
 		args := make([]string, 0, len(lines))
 		for _, line := range lines[1:] {
 			args = append(args, strings.TrimSpace(string(line)))
+		}
+		if isDefaultLsRefs(args) {
+			writeGitBody(w, "application/x-git-upload-pack-result", cachedLsRefs(repo, args))
+			return
 		}
 		writeGitBody(w, "application/x-git-upload-pack-result", lsRefs(repo, args))
 	case strings.HasPrefix(command, "command=fetch"):

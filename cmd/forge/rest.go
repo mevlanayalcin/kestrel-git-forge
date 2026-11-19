@@ -18,8 +18,14 @@ import (
 const jsonType = "application/json; charset=utf-8"
 
 func (s *Store) requestID() string {
-	n := s.requestSeq.Add(1)
-	return fmt.Sprintf("%016x", n)
+	n := uint64(s.requestSeq.Add(1))
+	var hexDigits = "0123456789abcdef"
+	var out [16]byte
+	for i := 15; i >= 0; i-- {
+		out[i] = hexDigits[n&0xf]
+		n >>= 4
+	}
+	return string(out[:])
 }
 
 func (s *Store) writeJSON(w http.ResponseWriter, status int, value any) {
@@ -36,7 +42,6 @@ func (s *Store) writeRaw(w http.ResponseWriter, status int, body []byte) {
 	header.Set("Content-Type", jsonType)
 	header.Set("Content-Length", strconv.Itoa(len(body)))
 	header.Set("X-GitHub-Request-Id", s.requestID())
-	header.Set("X-GitHub-Api-Version", "2022-11-28")
 	w.WriteHeader(status)
 	w.Write(body)
 }
@@ -127,44 +132,68 @@ func (s *Store) issueJSONLocked(repo *Repo, issue *Issue) map[string]any {
 		closed = issue.ClosedAt
 	}
 	return map[string]any{
-		"id":             issue.ID,
-		"node_id":        "I_" + strconv.FormatInt(issue.ID, 10),
-		"number":         issue.Number,
-		"title":          issue.Title,
-		"body":           issue.Body,
-		"state":          issue.State,
-		"state_reason":   nil,
-		"locked":         issue.Locked,
-		"labels":         labels,
-		"user":           map[string]any{"login": repo.Owner, "id": 1000, "type": "User"},
-		"assignee":       nil,
-		"assignees":      []any{},
-		"milestone":      nil,
-		"comments":       len(issue.Comments),
-		"created_at":     issue.Created,
-		"updated_at":     issue.Updated,
-		"closed_at":      closed,
-		"closed_by":      nil,
-		"html_url":       "http://github.local/" + repo.Owner + "/" + repo.Name + "/issues/" + strconv.Itoa(issue.Number),
-		"url":            "/api/v3/repos/" + repo.Owner + "/" + repo.Name + "/issues/" + strconv.Itoa(issue.Number),
-		"repository_url": "/api/v3/repos/" + repo.Owner + "/" + repo.Name,
+		"id":         issue.ID,
+		"number":     issue.Number,
+		"title":      issue.Title,
+		"body":       issue.Body,
+		"state":      issue.State,
+		"labels":     labels,
+		"user":       map[string]any{"login": repo.Owner, "id": 1000, "type": "User"},
+		"comments":   len(issue.Comments),
+		"created_at": issue.Created,
+		"updated_at": issue.Updated,
+		"closed_at":  closed,
+		"html_url":   "http://github.local/" + repo.Owner + "/" + repo.Name + "/issues/" + strconv.Itoa(issue.Number),
+		"url":        "/api/v3/repos/" + repo.Owner + "/" + repo.Name + "/issues/" + strconv.Itoa(issue.Number),
 	}
+}
+
+// repoJSONBytes is the repository object's wire bytes, cached until the repository is patched.
+func (s *Store) repoJSONBytes(repo *Repo) []byte {
+	repo.mu.RLock()
+	cached := repo.jsonCache
+	repo.mu.RUnlock()
+	if cached != nil {
+		return cached
+	}
+	body, err := json.Marshal(s.repoJSON(repo))
+	if err != nil {
+		return []byte(`{"message":"Internal Server Error"}`)
+	}
+	repo.mu.Lock()
+	repo.jsonCache = body
+	repo.mu.Unlock()
+	return body
+}
+
+// jsonArray joins already-marshaled objects into one array body without re-encoding them.
+func jsonArray(items [][]byte) []byte {
+	total := 2
+	for _, item := range items {
+		total += len(item) + 1
+	}
+	out := make([]byte, 0, total)
+	out = append(out, '[')
+	for index, item := range items {
+		if index > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, item...)
+	}
+	return append(out, ']')
 }
 
 func (s *Store) issueJSON(repo *Repo, issue *Issue) map[string]any {
 	return s.issueJSONLocked(repo, issue)
 }
 
-// issueBodyLocked returns the marshaled issue, cached until the issue changes. Callers hold the
-// repository lock; invalidateIssue drops the cache on every mutation.
+// issueBodyLocked returns the issue's wire bytes, cached until the issue changes. Callers hold
+// the repository lock; invalidateIssue drops the cache on every mutation.
 func (s *Store) issueBodyLocked(repo *Repo, issue *Issue) []byte {
 	if issue.cached != nil {
 		return issue.cached
 	}
-	body, err := json.Marshal(s.issueJSONLocked(repo, issue))
-	if err != nil {
-		return []byte(`{"message":"Internal Server Error"}`)
-	}
+	body := issueBody(repo, issue)
 	issue.cached = body
 	return body
 }
@@ -322,9 +351,9 @@ func (s *Store) listReposREST(w http.ResponseWriter, r *http.Request) {
 	if end > total {
 		end = total
 	}
-	items := make([]any, 0, end-start)
+	items := make([][]byte, 0, end-start)
 	for _, repo := range repos[start:end] {
-		items = append(items, s.repoJSON(repo))
+		items = append(items, s.repoJSONBytes(repo))
 	}
 	if end < total {
 		base := "http://" + r.Host + "/api/v3/user/repos"
@@ -333,7 +362,7 @@ func (s *Store) listReposREST(w http.ResponseWriter, r *http.Request) {
 		values.Set("page", strconv.Itoa(page+1))
 		w.Header().Set("Link", "<"+base+"?"+values.Encode()+`>; rel="next", <`+base+`?page=1>; rel="first"`)
 	}
-	s.writeJSON(w, 200, items)
+	s.writeRaw(w, 200, jsonArray(items))
 }
 
 func (s *Store) handleRepoREST(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -351,7 +380,7 @@ func (s *Store) handleRepoREST(w http.ResponseWriter, r *http.Request, parts []s
 	if len(rest) == 0 {
 		switch r.Method {
 		case http.MethodGet:
-			s.writeJSON(w, 200, s.repoJSON(repo))
+			s.writeRaw(w, 200, s.repoJSONBytes(repo))
 		case http.MethodPatch:
 			var body struct {
 				Description *string `json:"description"`
@@ -367,8 +396,9 @@ func (s *Store) handleRepoREST(w http.ResponseWriter, r *http.Request, parts []s
 			if body.Private != nil {
 				repo.Private = *body.Private
 			}
+			repo.jsonCache = nil
 			repo.mu.Unlock()
-			s.writeJSON(w, 200, s.repoJSON(repo))
+			s.writeRaw(w, 200, s.repoJSONBytes(repo))
 		case http.MethodDelete:
 			s.deleteRepo(owner, name)
 			w.Header().Set("X-GitHub-Request-Id", s.requestID())
