@@ -1,18 +1,20 @@
-# Rebuild the committed static binary from the Go source beside it.
+# Build the committed static binary from the C++20 source beside it.
 #
 # The trial runs `node /bot/main.ts`, which spawns ./bin/forge. bin/forge is committed as a
-# statically linked Linux amd64 binary (RULES.txt allows a vendored static binary), so a trial
-# needs no toolchain; this target is for changing the source.
+# statically linked Linux amd64 binary (RULES.txt allows a vendored static binary), so a trial needs
+# no toolchain; this target is for changing the source under cpp/.
 
-GO ?= go
+CXX ?= g++
+CXXFLAGS ?= -O3 -std=c++20 -static -s -pthread -Wall -Wextra
+LDLIBS ?= -lz
 
 .PHONY: build
 build:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -ldflags="-s -w" -o bin/forge ./cmd/forge
+	$(CXX) $(CXXFLAGS) cpp/*.cpp $(LDLIBS) -o bin/forge
 
 .PHONY: vet
 vet:
-	$(GO) vet ./...
+	$(CXX) -std=c++20 -fsyntax-only -Wall -Wextra cpp/*.cpp
 
 .PHONY: clean
 clean:

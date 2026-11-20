@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "A standalone GitHub-compatible git forge: git smart HTTP, REST v3, GraphQL v4 and MCP in one static Go process",
+  "description": "A standalone GitHub-compatible git forge: git smart HTTP, REST v3, GraphQL v4 and MCP in one static C++20 process",
   "license": "MIT",
   "engines": {
     "node": ">=22.18"
