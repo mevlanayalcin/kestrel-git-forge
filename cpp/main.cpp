@@ -8,7 +8,9 @@
 // and retire themselves after 3 s idle, so a 50-100 connection clone burst costs no fixed pool
 // starvation and leaves ~16 warm threads afterwards.  Cached responses (res.full) are handed to
 // send() straight from their immutable buffer: no framing, no copy, no request-id work unless the
-// cached bytes carry a request-id placeholder.
+// cached bytes carry a request-id placeholder.  After each response a worker briefly polls its
+// socket (spin-before-block, see spin_recv) so a sequential client's next request skips gVisor's
+// blocked-thread wake-up.
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -18,6 +20,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -86,10 +89,9 @@ static const char* status_text(int status) {
 static constexpr size_t kMaxHeaderBytes = 65536;
 static constexpr size_t kMaxBodyBytes = 256ull << 20;
 static constexpr size_t kMaxInputBytes = (256ull << 20) + kMaxHeaderBytes;
-static constexpr long long kReapMs = 6000;   // > undici's 4 s idle keep-alive: it closes first
-static constexpr int kWorkersStart = 16;
+static constexpr int kWorkersStart = 112;    // pre-warm >2x the 50-way clone burst before register
 static constexpr int kMaxWorkers = 210;      // stay well under the 256-pid sandbox budget
-static constexpr int kIdleExitSeconds = 3;
+static constexpr int kIdleExitSeconds = 30;
 
 struct Conn {
   int fd = -1;
@@ -423,13 +425,77 @@ static bool pump(Conn& c, Store& store) {
   return true;
 }
 
-// One blocking connection: parse what is buffered, then park in recv() for the next request.
+// Spin-before-block.  Under gVisor every blocked recv() is woken through the Sentry and a host futex,
+// and on a pod whose cores sit idle that wake (C-state exit, Sentry M wake-up, stub-thread
+// reschedule) costs more than the request itself.  So after answering, up to kMaxSpinners threads
+// poll their socket with non-blocking recv() for g_spin_ns before parking: the next sequential
+// request is picked up hot and the Sentry stays warm.  Measured on the one-pod shape (env + forge in
+// one sandbox, 4-CPU quota, idle 16-core cpuset): perf 87-90 -> 171-196, geomean 920 -> 175-254 ms.
+// The spin burns CPU, so it stays off when fewer than 3 CPUs of budget are visible (a 2-CPU quota
+// throttles it: one-pod 120 -> 85-100, sealed docker 991 -> 975); FORGE_SPIN_US overrides the
+// budget (0 disables).
+static constexpr int kMaxSpinners = 2;
+static long g_spin_ns = 2000000;
+static std::atomic<int> g_spinners{0};
+
+static inline long long mono_ns() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+
+// The CPUs this process may burn: the online CPU count, capped by a cgroup v2 cpu.max or v1
+// cfs_quota_us/cfs_period_us quota when one is visible (a 2-CPU docker --cpus shows 264 CPUs but
+// a "200000 100000" cpu.max).
+static double cpu_budget() {
+  double budget = (double)sysconf(_SC_NPROCESSORS_ONLN);
+  long long quota = -1, period = 0;
+  if (FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
+    char q[32] = {0};
+    if (std::fscanf(f, "%31s %lld", q, &period) == 2 && std::strcmp(q, "max") != 0) quota = std::atoll(q);
+    std::fclose(f);
+  } else if (FILE* fq = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r")) {
+    if (std::fscanf(fq, "%lld", &quota) != 1) quota = -1;
+    std::fclose(fq);
+    if (FILE* fp = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r")) {
+      if (std::fscanf(fp, "%lld", &period) != 1) period = 0;
+      std::fclose(fp);
+    }
+  }
+  if (quota > 0 && period > 0 && (double)quota / (double)period < budget) budget = (double)quota / (double)period;
+  return budget;
+}
+
+// Poll fd without blocking for up to g_spin_ns. Returns recv()'s result, or -1 with errno EAGAIN
+// when nothing arrived (or no spinner slot was free) and the caller should park.
+static ssize_t spin_recv(int fd, char* buf, size_t size) {
+  if (g_spin_ns <= 0 || g_spinners.fetch_add(1, std::memory_order_relaxed) >= kMaxSpinners) {
+    if (g_spin_ns > 0) g_spinners.fetch_sub(1, std::memory_order_relaxed);
+    errno = EAGAIN;
+    return -1;
+  }
+  ssize_t n;
+  long long until = mono_ns() + g_spin_ns;
+  for (;;) {
+    n = ::recv(fd, buf, size, MSG_DONTWAIT);
+    if (n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) break;
+    if (mono_ns() > until) break;
+  }
+  int saved = errno;
+  g_spinners.fetch_sub(1, std::memory_order_relaxed);
+  errno = saved;
+  return n;
+}
+
+// One blocking connection: parse what is buffered, then (after a short spin) park in recv() for
+// the next request.
 static void serve_connection(int fd, Store& store, Conn& c) {
   c.begin(fd);
   char buf[16384];
   for (;;) {
     if (!pump(c, store)) return;
-    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    ssize_t n = spin_recv(fd, buf, sizeof(buf));
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) n = ::recv(fd, buf, sizeof(buf), 0);
     if (n > 0) {
       if (c.in.size() - c.in_pos + (size_t)n > kMaxInputBytes) return;
       c.in.append(buf, (size_t)n);
@@ -437,7 +503,7 @@ static void serve_connection(int fd, Store& store, Conn& c) {
     }
     if (n == 0) return;  // peer closed
     if (errno == EINTR) continue;
-    return;  // timeout (6 s idle), or a fatal socket error
+    return;  // a fatal socket error
   }
 }
 
@@ -453,6 +519,9 @@ static std::atomic<bool> g_shutdown{false};
 static void* worker_entry(void* arg) {
   Store* store = (Store*)arg;
   Conn conn;
+  conn.in.reserve(16384);
+  conn.out.reserve(4096);
+  conn.req.headers.reserve(16);
   for (;;) {
     int fd;
     {
@@ -705,6 +774,11 @@ int main(int argc, char** argv) {
   std::string login = std::getenv("MAKEFUN_FORGE_LOGIN") ? std::getenv("MAKEFUN_FORGE_LOGIN") : "";
   if (login.empty()) login = "adaiversen";
 
+  if (const char* spin = std::getenv("FORGE_SPIN_US"))
+    g_spin_ns = std::atol(spin) * 1000;
+  else if (cpu_budget() < 3.0)
+    g_spin_ns = 0;
+
   signal(SIGTERM, on_signal);
   signal(SIGINT, on_signal);
   signal(SIGPIPE, SIG_IGN);
@@ -721,10 +795,16 @@ int main(int argc, char** argv) {
   getsockname(listen_fd, (struct sockaddr*)&bound, &bound_len);
   int port = ntohs(bound.sin_port);
 
-  // 16 warm blocking workers; each costs a 256 KiB stack and one pid.
+  // 112 warm blocking workers; each costs a 256 KiB stack and one pid, pre-warmed before register
+  // so the 50-way clone burst pays zero pthread_create/mmap on the timed path.
   for (int i = 0; i < kWorkersStart; i++) {
     if (!spawn_worker(&store)) break;
     g_total.fetch_add(1, std::memory_order_relaxed);
+  }
+  for (int wait_ms = 0;
+       wait_ms < 200 && g_idle.load(std::memory_order_relaxed) < g_total.load(std::memory_order_relaxed);
+       wait_ms++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
   std::printf("[forge] listening on port %d (%d warm blocking workers)\n", port,
@@ -744,10 +824,6 @@ int main(int argc, char** argv) {
     std::_Exit(0);
   }).detach();
 
-  struct timeval tv;
-  tv.tv_sec = kReapMs / 1000;
-  tv.tv_usec = (kReapMs % 1000) * 1000;
-
   while (!g_stop) {
     int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
     if (fd < 0) {
@@ -756,9 +832,8 @@ int main(int argc, char** argv) {
     }
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    // A client that abandons an idle keep-alive socket is reaped by recv()'s timeout.
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // No SO_RCVTIMEO/SO_SNDTIMEO: under gVisor every blocking recv() with a timeout arms a Sentry
+    // timer. undici closes its idle keep-alive sockets itself (4 s), which ends the worker's recv().
     dispatch_connection(fd, &store);
   }
 
