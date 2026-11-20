@@ -1,11 +1,11 @@
 // The entry <-> env lifecycle is the forge's own: ./bin/forge binds an ephemeral port, POSTs it to
 // $MAKEFUN_ENV_URL/register, serves until GET $MAKEFUN_ENV_URL/done answers {"done":true}, and exits
 // 0. This launcher only forwards the environment and the exit code, so the platform's
-// `node /bot/main.ts` runs the statically linked C++20 forge at ./bin/forge.
+// `node /bot/main.ts` runs the statically linked Go forge at ./bin/forge.
 //
 // The binary is committed beside this file (RULES.txt: "a statically linked Linux amd64 binary you
-// commit runs from your repository as vendored source"); the C++20 source that builds it is under
-// cpp/, and `make build` (g++ -O3 -std=c++20 -static -pthread ... -lz) rebuilds it.
+// commit runs from your repository as vendored source"); the Go source that builds it is under
+// cmd/forge and internal packages, and `make build` rebuilds it.
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
