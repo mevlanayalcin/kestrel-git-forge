@@ -430,9 +430,9 @@ static bool pump(Conn& c, Store& store) {
 // reschedule) costs more than the request itself.  So after answering, up to kMaxSpinners threads
 // poll their socket with non-blocking recv() for g_spin_ns before parking: the next sequential
 // request is picked up hot and the Sentry stays warm.  Measured on the one-pod shape (env + forge in
-// one sandbox, 4-CPU quota, idle 16-core cpuset): perf 87-90 -> 171-196, geomean 920 -> 175-254 ms.
+// one sandbox, 4-CPU quota, idle 16-core cpuset): perf 87-90 -> 179-196, geomean 920 -> 175-240 ms.
 // The spin burns CPU, so it stays off when fewer than 3 CPUs of budget are visible (a 2-CPU quota
-// throttles it: one-pod 120 -> 85-100, sealed docker 991 -> 975); FORGE_SPIN_US overrides the
+// throttles it: one-pod 155 -> 111, sealed docker 990 -> 979); FORGE_SPIN_US overrides the
 // budget (0 disables).
 static constexpr int kMaxSpinners = 2;
 static long g_spin_ns = 2000000;

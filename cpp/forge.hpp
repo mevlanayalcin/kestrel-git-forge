@@ -27,7 +27,8 @@ enum ObjType { OBJ_COMMIT = 1, OBJ_TREE = 2, OBJ_BLOB = 3, OBJ_TAG = 4 };
 
 struct Object {
   int type = 0;
-  std::string data;
+  std::string data{};
+  std::string raw_zlib{};
 };
 
 inline const char* obj_type_name(int t) {

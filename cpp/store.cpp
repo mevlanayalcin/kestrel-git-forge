@@ -73,6 +73,15 @@ std::vector<std::shared_ptr<Repo>> Store::list_repos(const std::string& owner) {
 
 bool Repo::ancestor_l(const std::string& tip, const std::string& want) const {
   if (tip == want) return true;
+  if (want.size() == 40) {
+    auto tip_obj = object_l(tip);
+    if (tip_obj && tip_obj->type == OBJ_COMMIT && tip_obj->data.size() >= 94 &&
+        std::memcmp(tip_obj->data.data(), "tree ", 5) == 0 && tip_obj->data[45] == '\n' &&
+        std::memcmp(tip_obj->data.data() + 46, "parent ", 7) == 0 && tip_obj->data[93] == '\n' &&
+        std::memcmp(tip_obj->data.data() + 53, want.data(), 40) == 0) {
+      return true;
+    }
+  }
   std::unordered_map<std::string, bool> seen;
   seen[tip] = true;
   std::vector<std::string> queue;

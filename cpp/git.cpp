@@ -191,6 +191,10 @@ std::string write_pack(const std::vector<std::shared_ptr<const Object>>& objects
   out.push_back((char)count);
   for (const auto& obj : objects) {
     append_pack_header(out, obj->type, obj->data.size());
+    if (!obj->raw_zlib.empty()) {
+      out += obj->raw_zlib;
+      continue;
+    }
     z_stream& zs = deflater.zs;
     deflateReset(&zs);
     uLong bound = deflateBound(&zs, (uLong)obj->data.size());
@@ -376,6 +380,7 @@ bool read_pack(const std::string& data,
       err = "inflate failed";
       return false;
     }
+    size_t raw_pos = pos;
     pos += used;
     std::shared_ptr<const Object> object;
     if (type >= 1 && type <= 4) {
@@ -383,7 +388,7 @@ bool read_pack(const std::string& data,
         err = "pack object size mismatch";
         return false;
       }
-      object = std::make_shared<const Object>(Object{type, std::move(payload)});
+      object = std::make_shared<const Object>(Object{type, std::move(payload), data.substr(raw_pos, used)});
     } else if (type == 6) {
       auto it = by_offset.find(base_offset);
       if (it == by_offset.end()) {
