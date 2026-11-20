@@ -1232,7 +1232,7 @@ struct GqlExec {
       found.second->state = "closed";
       found.second->closed_at = kBaseTime;
       found.second->updated = kBaseTime;
-      found.second->cached.reset();
+      found.second->invalidate_cache();
       JVal body = JVal::object();
       body.set("issue", select_issue(*found.first, *found.second, selection_of(field, "issue")));
       return body;

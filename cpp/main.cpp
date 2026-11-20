@@ -1,14 +1,26 @@
-// The process: bind an ephemeral port, register it, serve blocking keep-alive workers until /done.
+// The process: bind an ephemeral listener, register the port, then serve every HTTP/1.1
+// keep-alive connection on a *blocking* worker pool until /done.
+//
+// gVisor physics: a blocking recv()/send() pair costs two systrap exits per request, while an
+// epoll reactor pays a third (epoll_wait) before every read.  So the hot path parks one small
+// 256 KiB-stack thread per active connection, reads with plain recv(), routes, and writes with a
+// single send().  Threads are created on demand (16 warm at boot, +1 whenever every worker is busy)
+// and retire themselves after 3 s idle, so a 50-100 connection clone burst costs no fixed pool
+// starvation and leaves ~16 warm threads afterwards.  Cached responses (res.full) are handed to
+// send() straight from their immutable buffer: no framing, no copy, no request-id work unless the
+// cached bytes carry a request-id placeholder.
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -16,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -28,7 +41,16 @@ namespace kestrel {
 
 static volatile sig_atomic_t g_stop = 0;
 
-static void on_signal(int) { g_stop = 1; }
+static void on_signal(int) {
+  g_stop = 1;
+  std::_Exit(0);  // async-signal-safe; the harness only needs a prompt, clean process exit
+}
+
+static inline long long now_ms() {
+  return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 static const char* status_text(int status) {
   switch (status) {
@@ -59,113 +81,157 @@ static const char* status_text(int status) {
   }
 }
 
-static bool send_all(int fd, const char* data, size_t size) {
-  size_t sent = 0;
-  while (sent < size) {
-    ssize_t n = ::send(fd, data + sent, size - sent, MSG_NOSIGNAL);
-    if (n > 0) {
-      sent += (size_t)n;
-      continue;
-    }
-    if (n < 0 && errno == EINTR) continue;
-    return false;
-  }
-  return true;
-}
+// ---------------------------------------------------------------- connection state
 
-// ---------------------------------------------------------------- connection reader
+static constexpr size_t kMaxHeaderBytes = 65536;
+static constexpr size_t kMaxBodyBytes = 256ull << 20;
+static constexpr size_t kMaxInputBytes = (256ull << 20) + kMaxHeaderBytes;
+static constexpr long long kReapMs = 6000;   // > undici's 4 s idle keep-alive: it closes first
+static constexpr int kWorkersStart = 16;
+static constexpr int kMaxWorkers = 210;      // stay well under the 256-pid sandbox budget
+static constexpr int kIdleExitSeconds = 3;
 
 struct Conn {
-  int fd;
-  char buf[65536];
-  size_t pos = 0;
-  size_t len = 0;
+  int fd = -1;
+  std::string in;       // receive buffer (persistent across requests)
+  size_t in_pos = 0;    // first unconsumed byte
+  std::string out;      // scratch framing buffer for the non-cached paths
+  std::string hot;      // per-connection mutable copy for request-id stamping
+  const void* hot_src = nullptr;
+  Request req;          // reused parser target
+  Response res;         // reused router target
+  bool sent_continue = false;
 
-  bool fill() {
-    for (;;) {
-      if (pos < len) return true;
-      ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-      if (n > 0) {
-        pos = 0;
-        len = (size_t)n;
-        return true;
-      }
-      if (n < 0 && errno == EINTR) continue;
-      return false;
-    }
-  }
-
-  bool read_line(std::string& out) {
+  void begin(int socket_fd) {
+    fd = socket_fd;
+    in.clear();
+    in_pos = 0;
     out.clear();
-    for (;;) {
-      char* start = buf + pos;
-      size_t avail = len - pos;
-      void* nl = std::memchr(start, '\n', avail);
-      if (nl) {
-        size_t index = (char*)nl - start;
-        out.append(start, index);
-        pos += index + 1;
-        if (!out.empty() && out.back() == '\r') out.pop_back();
-        return true;
-      }
-      out.append(start, avail);
-      pos = len;
-      if (out.size() > 16384) return false;
-      if (!fill()) return false;
-    }
-  }
-
-  bool read_n(size_t count, std::string& out) {
-    out.clear();
-    out.reserve(count);
-    while (out.size() < count) {
-      if (pos >= len && !fill()) return false;
-      size_t take = len - pos;
-      if (take > count - out.size()) take = count - out.size();
-      out.append(buf + pos, take);
-      pos += take;
-    }
-    return true;
+    hot.clear();
+    hot_src = nullptr;
+    sent_continue = false;
+    req.body.clear();
+    res.reset();
   }
 };
 
-static bool read_request(Conn& conn, Request& req, bool& keep_alive) {
-  std::string line;
-  if (!conn.read_line(line)) return false;
-  while (line.empty()) {
-    if (!conn.read_line(line)) return false;
+// ---------------------------------------------------------------- request parsing
+
+enum class Parse { Ok, NeedMore, Bad };
+
+static Parse decode_chunked(const char* p, size_t n, std::string& body, size_t& used) {
+  body.clear();
+  size_t pos = 0;
+  for (;;) {
+    if (pos >= n) return Parse::NeedMore;
+    const char* nl = (const char*)std::memchr(p + pos, '\n', n - pos);
+    if (!nl) return Parse::NeedMore;
+    size_t line_end = (size_t)(nl - p);
+    size_t line_len = line_end - pos;
+    if (line_len > 0 && p[pos + line_len - 1] == '\r') line_len--;
+    if (line_len > 1024) return Parse::Bad;
+    size_t digits = 0;
+    unsigned long long size = 0;
+    for (size_t i = 0; i < line_len; i++) {
+      char c = p[pos + i];
+      if (c == ';' || c == ' ' || c == '\t') break;
+      int v = hexval(c);
+      if (v < 0) return Parse::Bad;
+      if (size > ((kMaxBodyBytes) >> 4)) return Parse::Bad;
+      size = (size << 4) | (unsigned long long)v;
+      digits++;
+    }
+    if (digits == 0) return Parse::Bad;
+    size_t data_at = line_end + 1;
+    if (size == 0) {
+      // Trailer section: consume header lines until an empty one.
+      size_t q = data_at;
+      for (;;) {
+        if (q >= n) return Parse::NeedMore;
+        const char* nl2 = (const char*)std::memchr(p + q, '\n', n - q);
+        if (!nl2) return Parse::NeedMore;
+        size_t le2 = (size_t)(nl2 - p);
+        size_t ll = le2 - q;
+        if (ll > 0 && p[q + ll - 1] == '\r') ll--;
+        q = le2 + 1;
+        if (ll == 0) {
+          used = q;
+          return Parse::Ok;
+        }
+      }
+    }
+    if (size > kMaxBodyBytes || body.size() + size > kMaxBodyBytes) return Parse::Bad;
+    if (n - data_at < size + 2) return Parse::NeedMore;
+    body.append(p + data_at, (size_t)size);
+    size_t after = data_at + (size_t)size;
+    if (p[after] == '\r' && p[after + 1] == '\n')
+      after += 2;
+    else if (p[after] == '\n')
+      after += 1;
+    else
+      return Parse::Bad;
+    pos = after;
   }
-  size_t sp1 = line.find(' ');
-  size_t sp2 = sp1 == std::string::npos ? std::string::npos : line.find(' ', sp1 + 1);
-  if (sp1 == std::string::npos || sp2 == std::string::npos) return false;
-  req.method = line.substr(0, sp1);
-  req.target = line.substr(sp1 + 1, sp2 - sp1 - 1);
-  std::string version = line.substr(sp2 + 1);
-  if (version != "HTTP/1.1" && version != "HTTP/1.0") return false;
+}
+
+// Parse one complete request starting at c.in_pos. On Ok, `end` is the absolute first byte after
+// the request. Nothing is consumed on NeedMore, so a pipelined trailing request is never dropped.
+static Parse parse_request(Conn& c, size_t& end, bool& keep_alive, bool& need_continue) {
+  const std::string& in = c.in;
+  const size_t start = c.in_pos;
+  const size_t avail = in.size() - start;
+  if (avail == 0) return Parse::NeedMore;
+
+  size_t hdr = in.find("\r\n\r\n", start);
+  if (hdr == std::string::npos) return avail > kMaxHeaderBytes ? Parse::Bad : Parse::NeedMore;
+  if (hdr - start > kMaxHeaderBytes) return Parse::Bad;
+
+  size_t eol = in.find("\r\n", start);
+  if (eol == std::string::npos || eol > hdr) return Parse::NeedMore;
+
+  size_t sp1 = in.find(' ', start);
+  if (sp1 == std::string::npos || sp1 > eol) return Parse::Bad;
+  size_t sp2 = in.find(' ', sp1 + 1);
+  if (sp2 == std::string::npos || sp2 > eol) return Parse::Bad;
+
+  Request& req = c.req;
+  req.method.assign(in, start, sp1 - start);
+  req.target.assign(in, sp1 + 1, sp2 - sp1 - 1);
+  std::string version = in.substr(sp2 + 1, eol - sp2 - 1);
+  if (version != "HTTP/1.1" && version != "HTTP/1.0") return Parse::Bad;
 
   req.headers.clear();
   size_t total = 0;
-  for (;;) {
-    if (!conn.read_line(line)) return false;
-    if (line.empty()) break;
-    total += line.size();
-    if (total > 65536) return false;
-    size_t colon = line.find(':');
-    if (colon == std::string::npos) continue;
-    std::string name = to_lower(trim_ws(line.substr(0, colon)));
-    std::string value = trim_ws(line.substr(colon + 1));
-    req.headers.emplace_back(std::move(name), std::move(value));
+  size_t pos = eol + 2;
+  while (pos < hdr) {
+    size_t nl = in.find("\r\n", pos);
+    if (nl == std::string::npos || nl > hdr) return Parse::Bad;
+    if (nl == pos) break;
+    total += nl - pos;
+    if (total > kMaxHeaderBytes) return Parse::Bad;
+    size_t colon = in.find(':', pos);
+    if (colon != std::string::npos && colon < nl) {
+      size_t nstart = pos, nend = colon;
+      while (nend > nstart && (in[nend - 1] == ' ' || in[nend - 1] == '\t')) nend--;
+      std::string name(in, nstart, nend - nstart);
+      for (char& ch : name)
+        if (ch >= 'A' && ch <= 'Z') ch = char(ch + 32);
+      size_t vstart = colon + 1, vend = nl;
+      while (vstart < vend && (in[vstart] == ' ' || in[vstart] == '\t')) vstart++;
+      while (vend > vstart && (in[vend - 1] == ' ' || in[vend - 1] == '\t')) vend--;
+      req.headers.emplace_back(std::move(name), in.substr(vstart, vend - vstart));
+    }
+    pos = nl + 2;
   }
 
   req.host = req.header("host");
-  std::string target = req.target;
-  size_t question = target.find('?');
+  size_t question = req.target.find('?');
   if (question == std::string::npos) {
-    req.path = url_decode(target, false);
+    req.path = url_decode(req.target, false);
     req.query.clear();
   } else {
-    req.path = url_decode(target.substr(0, question), false);
-    req.query = target.substr(question + 1);
+    req.path = url_decode(req.target.substr(0, question), false);
+    req.query = req.target.substr(question + 1);
   }
 
   std::string connection = to_lower(req.header("connection"));
@@ -174,53 +240,55 @@ static bool read_request(Conn& conn, Request& req, bool& keep_alive) {
   else
     keep_alive = connection.find("close") == std::string::npos;
 
-  std::string expect = to_lower(req.header("expect"));
-  if (expect.find("100-continue") != std::string::npos) {
-    static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
-    send_all(conn.fd, kContinue, sizeof(kContinue) - 1);
-  }
+  need_continue = to_lower(req.header("expect")).find("100-continue") != std::string::npos;
 
-  std::string transfer = to_lower(req.header("transfer-encoding"));
-  std::string length_header = req.header("content-length");
   req.body.clear();
+  size_t body_at = hdr + 4;
+  std::string transfer = to_lower(req.header("transfer-encoding"));
   if (transfer.find("chunked") != std::string::npos) {
-    for (;;) {
-      if (!conn.read_line(line)) return false;
-      size_t semi = line.find(';');
-      std::string size_text = semi == std::string::npos ? line : line.substr(0, semi);
-      size_text = trim_ws(size_text);
-      char* end = nullptr;
-      unsigned long long size = std::strtoull(size_text.c_str(), &end, 16);
-      if (end == size_text.c_str()) return false;
-      if (size == 0) {
-        for (;;) {
-          if (!conn.read_line(line)) return false;
-          if (line.empty()) break;
-        }
-        break;
-      }
-      if (size > (256ull << 20)) return false;
-      std::string chunk;
-      if (!conn.read_n((size_t)size, chunk)) return false;
-      req.body += chunk;
-      std::string crlf;
-      if (!conn.read_n(2, crlf)) return false;
-    }
-  } else if (!length_header.empty()) {
-    char* end = nullptr;
-    unsigned long long size = std::strtoull(length_header.c_str(), &end, 10);
-    if (end == length_header.c_str() || size > (256ull << 20)) return false;
-    if (size > 0 && !conn.read_n((size_t)size, req.body)) return false;
+    size_t used = 0;
+    Parse r = decode_chunked(in.data() + body_at, in.size() - body_at, req.body, used);
+    if (r != Parse::Ok) return r;
+    end = body_at + used;
+    return Parse::Ok;
   }
-  return true;
+  std::string length_header = req.header("content-length");
+  if (!length_header.empty()) {
+    char* parse_end = nullptr;
+    unsigned long long size = std::strtoull(length_header.c_str(), &parse_end, 10);
+    if (parse_end == length_header.c_str() || size > kMaxBodyBytes) return Parse::Bad;
+    if (in.size() - body_at < size) return Parse::NeedMore;
+    if (size) req.body.assign(in.data() + body_at, (size_t)size);
+    end = body_at + (size_t)size;
+    return Parse::Ok;
+  }
+  end = body_at;
+  return Parse::Ok;
 }
 
-static void send_response(Store& store, int fd, const Response& res, bool keep_alive) {
-  thread_local std::string out;
-  out.clear();
-  out.reserve(res.body.size() + 512);
+// ---------------------------------------------------------------- response framing
+
+static inline void stamp_request_id(Store& store, char* dst) {
+  uint64_t n = ++store.request_seq;
+  static const char* hex = "0123456789abcdef";
+  for (int i = 15; i >= 0; i--) {
+    dst[i] = hex[n & 15];
+    n >>= 4;
+  }
+}
+
+static void append_request_id(std::string& out, Store& store) {
+  out += "X-GitHub-Request-Id: ";
+  char id[16];
+  stamp_request_id(store, id);
+  out.append(id, sizeof(id));
+  out += "\r\n";
+}
+
+static void queue_normal(std::string& out, Response& res, bool keep_alive, Store& store) {
+  out.reserve(out.size() + res.body.size() + 512);
   out += "HTTP/1.1 ";
-  out += itoa10(res.status);
+  append_uint(out, (unsigned long long)res.status);
   out.push_back(' ');
   out += status_text(res.status);
   out += "\r\n";
@@ -235,11 +303,7 @@ static void send_response(Store& store, int fd, const Response& res, bool keep_a
     append_uint(out, res.body.size());
     out += "\r\n";
   }
-  if (res.with_request_id) {
-    out += "X-GitHub-Request-Id: ";
-    out += store.next_request_id();
-    out += "\r\n";
-  }
+  if (res.with_request_id) append_request_id(out, store);
   for (const auto& kv : res.headers) {
     out += kv.first;
     out += ": ";
@@ -249,93 +313,227 @@ static void send_response(Store& store, int fd, const Response& res, bool keep_a
   if (!keep_alive) out += "Connection: close\r\n";
   out += "\r\n";
   if (has_body) out += res.body;
-  send_all(fd, out.data(), out.size());
 }
 
-static void serve_connection(Store& store, int fd) {
-  struct timeval tv;
-  tv.tv_sec = 10;
-  tv.tv_usec = 0;
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  Conn conn;
-  conn.fd = fd;
-  while (!g_stop) {
-    Request req;
-    bool keep_alive = true;
-    if (!read_request(conn, req, keep_alive)) break;
-    Response res;
-    try {
-      route(store, req, res);
-    } catch (...) {
-      res = Response();
-      fail_json(store, res, 500, "Internal Server Error");
-    }
-    if (res.close_after) keep_alive = false;
-    send_response(store, fd, res, keep_alive);
-    if (!keep_alive) break;
+// Queue a complete pre-framed HTTP response. When the connection needs no request-id stamp, the
+// caller sends the shared immutable buffer directly from this function's hot path.
+static void queue_full(std::string& out, const Response& res, bool keep_alive, Store& store) {
+  const std::string& f = *res.full;
+  char rid[16];
+  if (res.id_offset) stamp_request_id(store, rid);
+
+  if (keep_alive) {
+    size_t base = out.size();
+    out.append(f);
+    if (res.id_offset && out.size() >= base + res.id_offset + 16)
+      std::memcpy(&out[base + res.id_offset], rid, 16);
+    return;
   }
-  ::close(fd);
+
+  // The client asked to close: insert Connection: close before the header terminator.
+  size_t he = f.find("\r\n\r\n");
+  if (he == std::string::npos) {
+    out.append(f);
+    return;
+  }
+  size_t base = out.size();
+  out.append(f.data(), he);
+  static const char kClose[] = "\r\nConnection: close";
+  out.append(kClose, sizeof(kClose) - 1);
+  out.append(f.data() + he, f.size() - he);
+  if (res.id_offset)
+    std::memcpy(&out[base + sizeof(kClose) - 1 + res.id_offset], rid, 16);
 }
 
-struct ConnQueue {
-  std::mutex mu;
-  std::condition_variable cv;
-  std::deque<int> fds;
-  bool stopping = false;
-
-  void push(int fd) {
-    {
-      std::lock_guard<std::mutex> lock(mu);
-      if (fds.size() >= 8192) {
-        ::close(fd);
-        return;
-      }
-      fds.push_back(fd);
+static bool send_all(int fd, const char* data, size_t size) {
+  size_t sent = 0;
+  while (sent < size) {
+    ssize_t n = ::send(fd, data + sent, size - sent, MSG_NOSIGNAL);
+    if (n > 0) {
+      sent += (size_t)n;
+      continue;
     }
-    cv.notify_one();
+    if (n < 0 && errno == EINTR) continue;
+    return false;
   }
-  int pop() {
-    std::unique_lock<std::mutex> lock(mu);
-    cv.wait(lock, [&] { return stopping || !fds.empty(); });
-    if (fds.empty()) return -1;
-    int fd = fds.front();
-    fds.pop_front();
-    return fd;
-  }
-};
+  return true;
+}
 
-static void* accept_loop(void* raw) {
-  auto* pair = (std::pair<int, ConnQueue*>*)raw;
-  int listen_fd = pair->first;
-  ConnQueue* queue = pair->second;
+// Send one response. The fast path is a single send() from an immutable cached buffer; the
+// request-id placeholder is stamped in a per-connection copy so the shared bytes stay read-only.
+static bool send_response(Conn& c, Response& res, bool keep_alive, Store& store) {
+  if (res.full && keep_alive) {
+    const std::string& f = *res.full;
+    if (!res.id_offset) return send_all(c.fd, f.data(), f.size());
+    if (c.hot_src != res.full.get() || c.hot.size() != f.size()) {
+      c.hot.assign(f.data(), f.size());
+      c.hot_src = res.full.get();
+    }
+    if (c.hot.size() >= res.id_offset + 16) stamp_request_id(store, &c.hot[res.id_offset]);
+    return send_all(c.fd, c.hot.data(), c.hot.size());
+  }
+  c.out.clear();
+  if (res.full)
+    queue_full(c.out, res, keep_alive, store);
+  else
+    queue_normal(c.out, res, keep_alive, store);
+  return send_all(c.fd, c.out.data(), c.out.size());
+}
+
+// Consume every complete request already buffered. Returns false when the connection must close.
+static bool pump(Conn& c, Store& store) {
+  static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
   for (;;) {
-    int fd = ::accept(listen_fd, nullptr, nullptr);
-    if (fd < 0) {
-      if (g_stop) break;
-      if (errno == EINTR) continue;
-      if (errno == EMFILE || errno == ENFILE) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        continue;
+    while (c.in_pos < c.in.size() && (c.in[c.in_pos] == '\r' || c.in[c.in_pos] == '\n')) c.in_pos++;
+    if (c.in_pos >= c.in.size()) break;
+
+    bool keep_alive = true;
+    bool need_continue = false;
+    size_t end = c.in_pos;
+    Parse state = parse_request(c, end, keep_alive, need_continue);
+    if (state == Parse::NeedMore) {
+      if (need_continue && !c.sent_continue) {
+        if (!send_all(c.fd, kContinue, sizeof(kContinue) - 1)) return false;
+        c.sent_continue = true;
       }
       break;
     }
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    queue->push(fd);
+    if (state == Parse::Bad) return false;
+    c.sent_continue = false;
+
+    c.res.reset();
+    try {
+      route(store, c.req, c.res);
+    } catch (...) {
+      c.res.reset();
+      fail_json(store, c.res, 500, "Internal Server Error");
+    }
+    if (!send_response(c, c.res, keep_alive, store)) return false;
+    c.in_pos = end;
+    if (!keep_alive) return false;
   }
-  return nullptr;
+
+  if (c.in_pos == c.in.size()) {
+    c.in.clear();
+    c.in_pos = 0;
+  } else if (c.in_pos > (1u << 20)) {
+    c.in.erase(0, c.in_pos);
+    c.in_pos = 0;
+  }
+  return true;
 }
 
-static void* worker_main(void* raw) {
-  auto* pair = (std::pair<Store*, ConnQueue*>*)raw;
-  Store* store = pair->first;
-  ConnQueue* queue = pair->second;
+// One blocking connection: parse what is buffered, then park in recv() for the next request.
+static void serve_connection(int fd, Store& store, Conn& c) {
+  c.begin(fd);
+  char buf[16384];
   for (;;) {
-    int fd = queue->pop();
-    if (fd < 0) break;
-    serve_connection(*store, fd);
+    if (!pump(c, store)) return;
+    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    if (n > 0) {
+      if (c.in.size() - c.in_pos + (size_t)n > kMaxInputBytes) return;
+      c.in.append(buf, (size_t)n);
+      continue;
+    }
+    if (n == 0) return;  // peer closed
+    if (errno == EINTR) continue;
+    return;  // timeout (6 s idle), or a fatal socket error
   }
-  return nullptr;
+}
+
+// ---------------------------------------------------------------- dynamic worker pool
+
+static std::mutex g_queue_mu;
+static std::condition_variable g_queue_cv;
+static std::deque<int> g_queue;
+static std::atomic<int> g_idle{0};
+static std::atomic<int> g_total{0};
+static std::atomic<bool> g_shutdown{false};
+
+static void* worker_entry(void* arg) {
+  Store* store = (Store*)arg;
+  Conn conn;
+  for (;;) {
+    int fd;
+    {
+      std::unique_lock<std::mutex> lock(g_queue_mu);
+      if (g_queue.empty()) {
+        if (g_shutdown.load(std::memory_order_relaxed)) return nullptr;
+        g_idle.fetch_add(1, std::memory_order_relaxed);
+        bool woken = g_queue_cv.wait_for(lock, std::chrono::seconds(kIdleExitSeconds), [] {
+          return !g_queue.empty() || g_shutdown.load(std::memory_order_relaxed);
+        });
+        g_idle.fetch_sub(1, std::memory_order_relaxed);
+        if (g_shutdown.load(std::memory_order_relaxed)) return nullptr;
+        if (g_queue.empty()) {
+          if (woken) continue;  // straggler notify with no work: park again
+          // Idle timeout: retire every thread above the 16-thread warm floor.
+          if (g_total.load(std::memory_order_relaxed) > kWorkersStart) {
+            g_total.fetch_sub(1, std::memory_order_relaxed);
+            return nullptr;
+          }
+          continue;
+        }
+      }
+      fd = g_queue.front();
+      g_queue.pop_front();
+    }
+    serve_connection(fd, *store, conn);
+    ::close(fd);
+  }
+}
+
+static bool spawn_worker(Store* store) {
+  pthread_attr_t attr;
+  if (pthread_attr_init(&attr) != 0) return false;
+  pthread_attr_setstacksize(&attr, 256 * 1024);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_t thread;
+  int rc = pthread_create(&thread, &attr, worker_entry, store);
+  pthread_attr_destroy(&attr);
+  return rc == 0;
+}
+
+// Queue an accepted socket. Spawns a fresh worker only when every existing worker is busy, so a
+// 50-100 connection burst never stalls behind a fixed pool, and idle traffic keeps the basic 16.
+static void dispatch_connection(int fd, Store* store) {
+  bool need_worker = false;
+  {
+    std::lock_guard<std::mutex> lock(g_queue_mu);
+    g_queue.push_back(fd);
+    if ((int)g_queue.size() > g_idle.load(std::memory_order_relaxed) &&
+        g_total.load(std::memory_order_relaxed) < kMaxWorkers) {
+      g_total.fetch_add(1, std::memory_order_relaxed);
+      need_worker = true;
+    }
+  }
+  g_queue_cv.notify_one();
+  if (need_worker && !spawn_worker(store))
+    g_total.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------- listeners
+
+static int create_listener(int port) {
+  int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) return -1;
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+  struct sockaddr_in addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons((uint16_t)port);
+  if (::bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  if (::listen(fd, 4096) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
 }
 
 // ---------------------------------------------------------------- tiny HTTP client (register/done)
@@ -452,7 +650,7 @@ static bool response_done(const std::string& response) {
 static bool register_port(const Url& url, int port) {
   std::string body = "{\"port\":" + itoa10(port) + "}";
   long long delay_ms = 50;
-  for (int attempt = 0; attempt < 400; attempt++) {
+  for (int attempt = 0; attempt < 400 && !g_stop; attempt++) {
     int status = 0;
     std::string response;
     if (http_call(url, "POST", "/register", body, status, response)) {
@@ -485,6 +683,11 @@ int main(int argc, char** argv) {
   (void)argv;
   using namespace kestrel;
 
+  struct rlimit rl;
+  rl.rlim_cur = 1 << 20;
+  rl.rlim_max = 1 << 20;
+  setrlimit(RLIMIT_NOFILE, &rl);
+
   const char* env_url = std::getenv("MAKEFUN_ENV_URL");
   if (!env_url || !*env_url) {
     std::fprintf(stderr, "[forge] MAKEFUN_ENV_URL is not set: there is no env to register with\n");
@@ -508,46 +711,24 @@ int main(int argc, char** argv) {
 
   Store store(login, token);
 
-  int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  int listen_fd = create_listener(0);
   if (listen_fd < 0) {
-    std::fprintf(stderr, "[forge] socket: %s\n", std::strerror(errno));
-    return 1;
-  }
-  int one = 1;
-  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  struct sockaddr_in addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = 0;
-  if (::bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-    std::fprintf(stderr, "[forge] bind: %s\n", std::strerror(errno));
-    return 1;
-  }
-  if (::listen(listen_fd, 4096) != 0) {
     std::fprintf(stderr, "[forge] listen: %s\n", std::strerror(errno));
     return 1;
   }
-  socklen_t addr_len = sizeof(addr);
-  getsockname(listen_fd, (struct sockaddr*)&addr, &addr_len);
-  int port = ntohs(addr.sin_port);
+  struct sockaddr_in bound;
+  socklen_t bound_len = sizeof(bound);
+  getsockname(listen_fd, (struct sockaddr*)&bound, &bound_len);
+  int port = ntohs(bound.sin_port);
 
-  ConnQueue queue;
-  std::pair<int, ConnQueue*> accept_args{listen_fd, &queue};
-  std::pair<Store*, ConnQueue*> worker_args{&store, &queue};
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 512 * 1024);
-  pthread_t acceptor;
-  if (pthread_create(&acceptor, &attr, accept_loop, &accept_args) == 0) pthread_detach(acceptor);
-  const int kWorkers = 96;
-  for (int i = 0; i < kWorkers; i++) {
-    pthread_t thread;
-    if (pthread_create(&thread, &attr, worker_main, &worker_args) == 0) pthread_detach(thread);
+  // 16 warm blocking workers; each costs a 256 KiB stack and one pid.
+  for (int i = 0; i < kWorkersStart; i++) {
+    if (!spawn_worker(&store)) break;
+    g_total.fetch_add(1, std::memory_order_relaxed);
   }
-  pthread_attr_destroy(&attr);
 
-  std::printf("[forge] listening on port %d\n", port);
+  std::printf("[forge] listening on port %d (%d warm blocking workers)\n", port,
+              g_total.load(std::memory_order_relaxed));
   std::fflush(stdout);
 
   if (!register_port(env_target, port)) {
@@ -556,9 +737,34 @@ int main(int argc, char** argv) {
   }
   std::printf("[forge] registered; waiting for the env to say done\n");
   std::fflush(stdout);
-  wait_for_done(env_target);
+
+  std::thread([&env_target]() {
+    wait_for_done(env_target);
+    std::fflush(stdout);
+    std::_Exit(0);
+  }).detach();
+
+  struct timeval tv;
+  tv.tv_sec = kReapMs / 1000;
+  tv.tv_usec = (kReapMs % 1000) * 1000;
+
+  while (!g_stop) {
+    int fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+    if (fd < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    // A client that abandons an idle keep-alive socket is reaped by recv()'s timeout.
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    dispatch_connection(fd, &store);
+  }
+
+  g_shutdown.store(true, std::memory_order_relaxed);
+  g_queue_cv.notify_all();
   std::printf("[forge] done\n");
   std::fflush(stdout);
-  // Workers are parked on the accept queue; process teardown must not wait on them.
   std::_Exit(0);
 }

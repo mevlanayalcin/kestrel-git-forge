@@ -120,6 +120,16 @@ struct Issue {
   std::string closed_at;
   std::vector<std::shared_ptr<Comment>> comments;
   std::shared_ptr<const std::string> cached;
+  // Complete pre-serialized HTTP/1.1 response (status line + headers + body) for GET by number.
+  // It carries a fixed-width request-id placeholder at http_id_offset that the reactor stamps
+  // in place, so a warm sequential read is one contiguous send() with no JSON work at all.
+  std::shared_ptr<const std::string> http_cache;
+  size_t http_id_offset = 0;
+  void invalidate_cache() {
+    cached.reset();
+    http_cache.reset();
+    http_id_offset = 0;
+  }
 };
 
 struct PRFile {
@@ -313,9 +323,22 @@ struct Response {
   std::vector<std::pair<std::string, std::string>> headers;
   std::string body;
   bool with_request_id = true;
-  bool close_after = false;
+  // When set, the reactor sends these exact bytes as the complete HTTP response.  It is how the
+  // hot clone and read paths hand an immutable, pre-framed buffer straight to send().
+  std::shared_ptr<const std::string> full;
+  // Offset of a fixed-width (16 byte) request-id placeholder inside `full`; 0 means none.
+  size_t id_offset = 0;
 
   void set_header(const std::string& k, const std::string& v) { headers.emplace_back(k, v); }
+  void reset() {
+    status = 200;
+    content_type = "application/json; charset=utf-8";
+    headers.clear();
+    body.clear();
+    with_request_id = true;
+    full.reset();
+    id_offset = 0;
+  }
 };
 
 void route(Store& store, const Request& req, Response& res);

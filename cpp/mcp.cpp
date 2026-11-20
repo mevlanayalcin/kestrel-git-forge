@@ -361,7 +361,7 @@ ToolCall call_tool(Store& store, const std::string& name, const JVal& args) {
     }
     issue->state = "closed";
     issue->closed_at = kBaseTime;
-    issue->cached.reset();
+    issue->invalidate_cache();
     std::string text;
     issue_full_json_l(text, *repo, *issue);
     call.result = tool_content(parse_json_text(text));
@@ -391,7 +391,7 @@ ToolCall call_tool(Store& store, const std::string& name, const JVal& args) {
     comment->login = owner;
     comment->created = kBaseTime;
     issue->comments.push_back(comment);
-    issue->cached.reset();
+    issue->invalidate_cache();
     std::string text;
     comment_json_l(text, *repo, *issue, *comment);
     call.result = tool_content(parse_json_text(text));

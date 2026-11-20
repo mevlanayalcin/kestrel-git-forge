@@ -13,6 +13,20 @@ namespace kestrel {
 
 static const char* kAgentName = "kestrel-forge/1.0";
 
+// A complete, immutable HTTP/1.1 response (status line + headers + body) for a git route. The
+// reactor can hand these bytes to send() with no per-request framing or copies.
+static std::shared_ptr<const std::string> git_http(const char* content_type, std::string body) {
+  std::string out;
+  out.reserve(body.size() + 256);
+  out += "HTTP/1.1 200 OK\r\nContent-Type: ";
+  out += content_type;
+  out += "\r\nContent-Length: ";
+  append_uint(out, body.size());
+  out += "\r\nCache-Control: no-cache\r\n\r\n";
+  out += body;
+  return std::make_shared<const std::string>(std::move(out));
+}
+
 static bool split_pkt_lines(const std::string& body, std::vector<std::string>& lines, size_t& rest) {
   size_t pos = 0;
   for (;;) {
@@ -154,7 +168,9 @@ static std::shared_ptr<const std::string> cached_advertisement(Repo& repo, const
     gen = repo.refs_gen;
     body = advertisement_v0_l(repo, service);
   }
-  auto value = std::make_shared<const std::string>(std::move(body));
+  const char* content_type = receive ? "application/x-git-receive-pack-advertisement"
+                                     : "application/x-git-upload-pack-advertisement";
+  auto value = git_http(content_type, std::move(body));
   std::unique_lock<std::shared_mutex> lock(repo.mu);
   if (repo.refs_gen != gen) return value;
   if (receive) {
@@ -230,7 +246,7 @@ static std::shared_ptr<const std::string> cached_ls_refs(Repo& repo, const std::
     gen = repo.refs_gen;
     built = ls_refs_l(repo, args);
   }
-  auto value = std::make_shared<const std::string>(std::move(built));
+  auto value = git_http("application/x-git-upload-pack-result", std::move(built));
   std::unique_lock<std::shared_mutex> lock(repo.mu);
   if (repo.refs_gen != gen) return value;
   repo.refs_cache = value;
@@ -321,10 +337,10 @@ static std::string build_fetch_v0_locked(const Repo& repo, const std::vector<std
   return buf;
 }
 
-// The shared, generation-keyed upload-pack response cache: the clone path serves memcpy only.
-static std::shared_ptr<const std::string> cached_upload(Repo& repo, const std::string& kind,
-                                                        const std::string& request_body,
-                                                        const std::function<std::string()>& build) {
+// The shared, generation-keyed upload-pack HTTP response cache: the clone path serves send() only.
+static std::shared_ptr<const std::string> cached_upload(
+    Repo& repo, const std::string& kind, const std::string& request_body,
+    const std::function<std::shared_ptr<const std::string>()>& build) {
   std::string key;
   long long gen = 0;
   {
@@ -336,7 +352,7 @@ static std::shared_ptr<const std::string> cached_upload(Repo& repo, const std::s
     if (it != repo.upload_cache.end()) return it->second;
   }
   std::lock_guard<std::mutex> build_lock(repo.build_mu);
-  std::string built;
+  std::shared_ptr<const std::string> value;
   {
     std::shared_lock<std::shared_mutex> lock(repo.mu);
     gen = repo.refs_gen;
@@ -344,9 +360,8 @@ static std::shared_ptr<const std::string> cached_upload(Repo& repo, const std::s
     key += request_body;
     auto it = repo.upload_cache.find(key);
     if (it != repo.upload_cache.end()) return it->second;
-    built = build();
+    value = build();
   }
-  auto value = std::make_shared<const std::string>(std::move(built));
   std::unique_lock<std::shared_mutex> lock(repo.mu);
   if (repo.refs_gen != gen) return value;
   if (repo.upload_cache_gen != gen) {
@@ -540,11 +555,15 @@ void handle_git(Store& store, const Request& req, Response& res) {
   }
   std::string suffix = req.path.substr(index + 5);
   res.with_request_id = false;
-  auto write_git = [&](const std::string& content_type, const std::string& body) {
+  auto write_git = [&](const char* content_type, std::string body) {
     res.status = 200;
     res.content_type = content_type;
-    res.body = body;
+    res.body = std::move(body);
     res.set_header("Cache-Control", "no-cache");
+  };
+  auto write_full = [&](std::shared_ptr<const std::string> full) {
+    res.status = 200;
+    res.full = std::move(full);
   };
 
   if (suffix == "info/refs") {
@@ -554,17 +573,16 @@ void handle_git(Store& store, const Request& req, Response& res) {
     }
     std::string service = query_param(req.query, "service");
     if (service == "git-upload-pack") {
-      // Close upload-pack connections after each response: undici's pooled keep-alive re-use
-      // can stall for its idle timeout when a request is dispatched in the same turn a prior
-      // response completed. One request per connection is deterministic and fast here.
-      res.close_after = true;
       if (req.header("git-protocol").find("version=2") != std::string::npos) {
-        write_git("application/x-git-upload-pack-advertisement", advertisement_v2());
+        // The v2 capability advertisement is a constant: frame it once, share it forever.
+        static const std::shared_ptr<const std::string> kAdvV2 =
+            git_http("application/x-git-upload-pack-advertisement", advertisement_v2());
+        write_full(kAdvV2);
       } else {
-        write_git("application/x-git-upload-pack-advertisement", *cached_advertisement(*repo, service));
+        write_full(cached_advertisement(*repo, service));
       }
     } else if (service == "git-receive-pack") {
-      write_git("application/x-git-receive-pack-advertisement", *cached_advertisement(*repo, service));
+      write_full(cached_advertisement(*repo, service));
     } else {
       fail_json(store, res, 404, "Not Found");
     }
@@ -576,7 +594,6 @@ void handle_git(Store& store, const Request& req, Response& res) {
       fail_json(store, res, 404, "Not Found");
       return;
     }
-    res.close_after = true;
     bool v2 = req.header("git-protocol").find("version=2") != std::string::npos;
     if (!v2) {
       std::vector<std::string> wants, haves, shallow;
@@ -585,10 +602,10 @@ void handle_git(Store& store, const Request& req, Response& res) {
         fail_json(store, res, 400, "Bad Request");
         return;
       }
-      auto body = cached_upload(*repo, "v0", req.body, [&]() {
-        return build_fetch_v0_locked(*repo, wants, haves, shallow, depth);
-      });
-      write_git("application/x-git-upload-pack-result", *body);
+      write_full(cached_upload(*repo, "v0", req.body, [&]() {
+        return git_http("application/x-git-upload-pack-result",
+                        build_fetch_v0_locked(*repo, wants, haves, shallow, depth));
+      }));
       return;
     }
     std::vector<std::string> lines;
@@ -605,8 +622,10 @@ void handle_git(Store& store, const Request& req, Response& res) {
       if (is_default_ls_refs(args))
         body = cached_ls_refs(*repo, req.body, args);
       else
-        body = cached_upload(*repo, "ls", req.body, [&]() { return ls_refs_l(*repo, args); });
-      write_git("application/x-git-upload-pack-result", *body);
+        body = cached_upload(*repo, "ls", req.body, [&]() {
+          return git_http("application/x-git-upload-pack-result", ls_refs_l(*repo, args));
+        });
+      write_full(std::move(body));
       return;
     }
     if (starts_with(command, "command=fetch")) {
@@ -634,7 +653,7 @@ void handle_git(Store& store, const Request& req, Response& res) {
         }
       }
       if (wants.empty()) {
-        write_git("application/x-git-upload-pack-result", kPktFlush);
+        write_full(git_http("application/x-git-upload-pack-result", kPktFlush));
         return;
       }
       if (depth == 1 && wants.size() == 1 && haves.empty()) {
@@ -659,18 +678,18 @@ void handle_git(Store& store, const Request& req, Response& res) {
               std::shared_lock<std::shared_mutex> lock(repo->mu);
               built = build_fetch_v2_locked(*repo, wants, {}, {}, depth);
             }
-            body = std::make_shared<const std::string>(std::move(built.body));
+            body = git_http("application/x-git-upload-pack-result", std::move(built.body));
             std::unique_lock<std::shared_mutex> lock(repo->mu);
             repo->pack_cache[key] = body;
           }
         }
-        write_git("application/x-git-upload-pack-result", *body);
+        write_full(std::move(body));
         return;
       }
-      auto body = cached_upload(*repo, "f2", req.body, [&]() {
-        return build_fetch_v2_locked(*repo, wants, haves, client_shallow, depth).body;
-      });
-      write_git("application/x-git-upload-pack-result", *body);
+      write_full(cached_upload(*repo, "f2", req.body, [&]() {
+        return git_http("application/x-git-upload-pack-result",
+                        build_fetch_v2_locked(*repo, wants, haves, client_shallow, depth).body);
+      }));
       return;
     }
     fail_json(store, res, 400, "Bad Request");
@@ -688,7 +707,7 @@ void handle_git(Store& store, const Request& req, Response& res) {
       return;
     }
     if (push_wants_sideband(req.body)) report = sideband_report(report);
-    write_git("application/x-git-receive-pack-result", report);
+    write_git("application/x-git-receive-pack-result", std::move(report));
     return;
   }
 

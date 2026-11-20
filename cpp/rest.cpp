@@ -359,7 +359,7 @@ static void comments_rest(Store& store, const Request& req, Response& res, Repo&
     comment->created = kBaseTime;
     issue->comments.push_back(comment);
     issue->updated = kBaseTime;
-    issue->cached.reset();
+    issue->invalidate_cache();
     std::string out;
     comment_json_l(out, repo, *issue, *comment);
     write_json_text(store, res, 201, std::move(out));
@@ -395,9 +395,25 @@ static void issue_rest(Store& store, const Request& req, Response& res, Repo& re
       fail_json(store, res, 404, "Not Found");
       return;
     }
-    if (!issue->cached) issue->cached = std::make_shared<const std::string>(issue_compact_json_l(repo, *issue));
-    std::string body = *issue->cached;
-    write_json_text(store, res, 200, std::move(body));
+    if (!issue->http_cache) {
+      if (!issue->cached)
+        issue->cached = std::make_shared<const std::string>(issue_compact_json_l(repo, *issue));
+      const std::string& body = *issue->cached;
+      std::string out;
+      out.reserve(body.size() + 192);
+      out += "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ";
+      append_uint(out, body.size());
+      out += "\r\nX-GitHub-Request-Id: ";
+      issue->http_id_offset = out.size();
+      out.append(16, '0');
+      out += "\r\n\r\n";
+      out += body;
+      issue->http_cache = std::make_shared<const std::string>(std::move(out));
+    }
+    res.status = 200;
+    res.with_request_id = false;
+    res.full = issue->http_cache;
+    res.id_offset = issue->http_id_offset;
     return;
   }
   if (req.method == "PATCH") {
@@ -431,7 +447,7 @@ static void issue_rest(Store& store, const Request& req, Response& res, Repo& re
         if (entry.type == JVal::STR) issue->labels.push_back(entry.s);
     }
     issue->updated = kBaseTime;
-    issue->cached.reset();
+    issue->invalidate_cache();
     std::string out = issue_compact_json_l(repo, *issue);
     issue->cached = std::make_shared<const std::string>(out);
     write_json_text(store, res, 200, std::move(out));
